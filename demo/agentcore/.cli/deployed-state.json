@@ -1,0 +1,17 @@
+{
+  "targets": {
+    "default": {
+      "resources": {
+        "runtimes": {
+          "demo": {
+            "runtimeId": "demo_demo-94tzRa5StO",
+            "runtimeArn": "arn:aws:bedrock-agentcore:us-east-1:807598718319:runtime/demo_demo-94tzRa5StO",
+            "roleArn": "arn:aws:iam::807598718319:role/AgentCore-demo-default-ApplicationAgentDemoRuntimeE-1HbAxLkqlwNI"
+          }
+        },
+        "stackName": "AgentCore-demo-default",
+        "deployHash": "6d70fd8883249bb6"
+      }
+    }
+  }
+}

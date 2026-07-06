@@ -2,6 +2,8 @@ from typing import Any
 import os
 import httpx
 import asyncio
+import boto3
+import json
 from datetime import datetime, date
 
 from strands import Agent, tool
@@ -15,9 +17,73 @@ log = app.logger
 # Define a Streamable HTTP MCP Client
 mcp_clients = [get_streamable_http_mcp_client()]
 
-DEFAULT_SYSTEM_PROMPT = """
+# Fallback prompt in case the Bedrock API fails
+FALLBACK_SYSTEM_PROMPT = """
 You are a helpful assistant. Use tools when appropriate.
 """
+
+# --- BEDROCK PROMPT MANAGEMENT ---
+def fetch_bedrock_prompt(user_name: str = "Guest") -> str:
+    """
+    Fetches the prompt dynamically from AWS Bedrock and injects variables.
+    """
+    prompt_id = os.environ.get("BEDROCK_PROMPT_ID", "arn:aws:bedrock:us-east-1:807598718319:prompt/5I3LESIERR")
+    
+    if prompt_id == "YOUR_PROMPT_ID_HERE":
+        log.warning("⚠️ No BEDROCK_PROMPT_ID found. Using fallback prompt.")
+        return FALLBACK_SYSTEM_PROMPT
+        
+    try:
+        client = boto3.client('bedrock-agent', region_name='us-east-1')
+        response = client.get_prompt(
+            promptIdentifier=prompt_id,
+            promptVersion='DRAFT' 
+        )
+        
+        # THE FIX: Boto3 puts 'variants' right at the root level!
+        variants = response.get('variants', [])
+        
+        raw_text = FALLBACK_SYSTEM_PROMPT
+        if variants:
+            config = variants[0].get('templateConfiguration', {})
+            
+            # Deep search for the text in standard text format
+            if 'text' in config:
+                raw_text = config['text'].get('text', FALLBACK_SYSTEM_PROMPT)
+            
+            # Deep search for the text in chat format (system OR user message)
+            elif 'chat' in config:
+                if 'system' in config['chat'] and config['chat']['system']:
+                    raw_text = config['chat']['system'][0].get('text', FALLBACK_SYSTEM_PROMPT)
+                elif 'messages' in config['chat'] and config['chat']['messages']:
+                    raw_text = config['chat']['messages'][0]['content'][0].get('text', FALLBACK_SYSTEM_PROMPT)
+        
+        # 1. INJECT THE VARIABLE LOCAL LAYER
+        final_prompt = raw_text.replace("{{user_name}}", user_name)
+        
+        # 2. VERIFICATION LOGGING
+        log.info(f"✅ SUCCESS: Loaded prompt from AWS Bedrock! Prompt text: {final_prompt}")
+        
+        return final_prompt
+
+    except Exception as e:
+        log.error(f"❌ Failed to fetch prompt from Bedrock: {e}. Using fallback.")
+        return FALLBACK_SYSTEM_PROMPT
+# ---------------------------------
+
+# --- CONFIGURATION LAYER ---
+def create_agent(user_name: str = "Guest"):
+    """
+    Creates a fresh agent on every request to ensure the latest 
+    Bedrock prompt is loaded without requiring a container restart.
+    """
+    return Agent(
+        model=OpenRouterAdapter(), 
+        system_prompt=fetch_bedrock_prompt(user_name=user_name),
+        tools=tools,
+        conversation_manager=_make_conversation_manager(),
+        hooks=[],
+    )
 
 # --- YOUR INTEGRATED TOOLS ---
 @tool
@@ -68,12 +134,10 @@ class OpenRouterAdapter:
             role = msg.get("role", "user")
             content_string = ""
             
-            # Bedrock sends nested lists: [{"text": "Hello"}]
             if isinstance(msg.get("content"), list):
                 for block in msg["content"]:
                     if isinstance(block, dict) and "text" in block:
                         content_string += block["text"]
-            # Fallback if it's already a string
             elif isinstance(msg.get("content"), str):
                 content_string = msg["content"]
                 
@@ -88,8 +152,6 @@ class OpenRouterAdapter:
         async with httpx.AsyncClient(timeout=60.0) as client:
             response = await client.post(url, headers=headers, json=payload)
             
-            # 2. ENHANCED ERROR LOGGING
-            # If OpenRouter rejects it, print the exact reason to the console before crashing
             if response.status_code != 200:
                 print(f"\n--- OPENROUTER API ERROR ---\n{response.text}\n----------------------------\n")
                 
@@ -118,21 +180,6 @@ class OpenRouterAdapter:
         }
 # ---------------------------------------
 
-_agent = None
-
-def get_or_create_agent():
-    global _agent
-    if _agent is None:
-        _agent = Agent(
-            # Pass the INSTANTIATED class, not a raw function
-            model=OpenRouterAdapter(), 
-            system_prompt=DEFAULT_SYSTEM_PROMPT,
-            tools=tools,
-            conversation_manager=_make_conversation_manager(),
-            hooks=[],
-        )
-    return _agent
-
 # --- HARNESS UTILS ---
 def _extract_prompt(payload: dict):
     if "messages" in payload:
@@ -148,7 +195,29 @@ def _extract_prompt(payload: dict):
 @app.entrypoint
 async def invoke(payload, context):
     log.info("Invoking Agent.....")
-    agent = get_or_create_agent()
+    
+    incoming_user = "Guest"
+    raw_text = payload.get("prompt", "")
+    
+    # 1. THE TRICK: Check if the text from the chat box is actually a JSON string
+    try:
+        if isinstance(raw_text, str) and raw_text.strip().startswith("{"):
+            parsed_data = json.loads(raw_text)
+            
+            # Extract the username from the parsed string
+            incoming_user = parsed_data.get("user_name", "Guest")
+            
+            # Fix the payload so the agent only sees the prompt and not the raw JSON
+            payload["prompt"] = parsed_data.get("prompt", "")
+    except json.JSONDecodeError:
+        pass # It was just a normal chat message, do nothing
+        
+    # 2. Fallback: If it wasn't a JSON string, check the root payload 
+    if incoming_user == "Guest":
+        incoming_user = payload.get("user_name", "Guest")
+    
+    # 3. Inject it into the agent
+    agent = create_agent(user_name=incoming_user) 
     prompt = _extract_prompt(payload)
 
     async for event in agent.stream_async(prompt):
